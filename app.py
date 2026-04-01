@@ -14,8 +14,7 @@ from dotenv import load_dotenv
 
 from agent import run_agent
 from config import OUTPUT_DIR, REPLICATE_LORA_URL, IMAGE_MODELS, LLM_MODELS
-from image_tools import build_image_prompts, generate_all_images, generate_image
-from image_tools import build_image_prompts, generate_all_images, generate_image
+from image_tools import build_image_prompts, build_style_guide, generate_all_images, generate_image
 from video_tools import assemble_video, generate_video_clip
 from caption_tools import write_captions
 
@@ -316,6 +315,42 @@ with col_btn2:
     full_run_clicked = st.button("🚀 Generate Everything", use_container_width=True)
 
 
+# ── Session state initialization ────────────────────────────────────────────────
+if "content_package" not in st.session_state:
+    st.session_state.content_package = None
+if "last_error_msg" not in st.session_state:
+    st.session_state.last_error_msg = None
+if "last_error_trace" not in st.session_state:
+    st.session_state.last_error_trace = None
+if "save_path" not in st.session_state:
+    st.session_state.save_path = None
+if "run_folder" not in st.session_state:
+    st.session_state.run_folder = None
+# Style guide state
+if "style_guide" not in st.session_state:
+    st.session_state.style_guide = {}
+if "style_guide_error" not in st.session_state:
+    st.session_state.style_guide_error = None
+# Phase 2 image state
+if "image_prompts" not in st.session_state:
+    st.session_state.image_prompts = None
+if "image_results" not in st.session_state:
+    st.session_state.image_results = None
+if "img_error_msg" not in st.session_state:
+    st.session_state.img_error_msg = None
+# Phase 3 video state
+if "video_clips" not in st.session_state:
+    st.session_state.video_clips = {}
+if "video_error_msg" not in st.session_state:
+    st.session_state.video_error_msg = None
+if "final_video_path" not in st.session_state:
+    st.session_state.final_video_path = None
+# Phase 4 captions state
+if "captions" not in st.session_state:
+    st.session_state.captions = None
+if "cap_error_msg" not in st.session_state:
+    st.session_state.cap_error_msg = None
+
 # ── Sidebar — LoRA config ─────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🧠 Master AI Agent")
@@ -361,6 +396,75 @@ with st.sidebar:
     st.markdown("**Image settings**")
     st.caption("1080 × 1920 · 28 steps · LoRA scale 0.85")
     st.divider()
+    st.markdown("## 📸 Style References")
+    st.caption("Upload reference images to lock consistent outfit, background, and kitchenware across all generated frames.")
+
+    with st.expander("👗 Clothing References (up to 5)"):
+        clothing_uploads = st.file_uploader(
+            "Outfit / clothing references",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+            key="clothing_refs",
+            label_visibility="collapsed",
+        )
+        if clothing_uploads:
+            st.caption(f"{min(len(clothing_uploads), 5)} image(s) uploaded")
+
+    with st.expander("🏠 Background References (up to 5)"):
+        background_uploads = st.file_uploader(
+            "Kitchen / background references",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+            key="background_refs",
+            label_visibility="collapsed",
+        )
+        if background_uploads:
+            st.caption(f"{min(len(background_uploads), 5)} image(s) uploaded")
+
+    with st.expander("🍳 Kitchenware References (up to 5)"):
+        kitchenware_uploads = st.file_uploader(
+            "Kitchenware / tools references",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+            key="kitchenware_refs",
+            label_visibility="collapsed",
+        )
+        if kitchenware_uploads:
+            st.caption(f"{min(len(kitchenware_uploads), 5)} image(s) uploaded")
+
+    any_refs = any([clothing_uploads, background_uploads, kitchenware_uploads])
+    analyze_clicked = st.button(
+        "🔍 Analyse References",
+        key="analyze_refs_btn",
+        disabled=not any_refs,
+        use_container_width=True,
+    )
+
+    if analyze_clicked and any_refs:
+        st.session_state.style_guide_error = None
+        with st.spinner("Analysing reference images..."):
+            try:
+                st.session_state.style_guide = build_style_guide(
+                    clothing_images=[f.read() for f in (clothing_uploads or [])[:5]],
+                    background_images=[f.read() for f in (background_uploads or [])[:5]],
+                    kitchenware_images=[f.read() for f in (kitchenware_uploads or [])[:5]],
+                    llm_id=llm_id,
+                )
+            except Exception as e:
+                st.session_state.style_guide_error = str(e)
+
+    if st.session_state.style_guide_error:
+        st.error(f"Style analysis failed: {st.session_state.style_guide_error}")
+
+    if st.session_state.style_guide:
+        st.success("✅ Style guide active — consistency locked")
+        with st.expander("📋 View Style Guide JSON"):
+            st.json(st.session_state.style_guide)
+        if st.button("🗑 Clear Style Guide", key="clear_style_btn"):
+            st.session_state.style_guide = {}
+            st.rerun()
+
+    st.divider()
     st.markdown("## 🗂 Run History")
     for run_dir in all_runs[:10]: # show last 10
         try:
@@ -391,39 +495,6 @@ with st.sidebar:
                 st.markdown("<hr style='margin:0.5rem 0'>", unsafe_allow_html=True)
         except Exception:
             pass
-
-
-# ── Session state ──────────────────────────────────────────────────────────────
-if "content_package" not in st.session_state:
-    st.session_state.content_package = None
-if "last_error_msg" not in st.session_state:
-    st.session_state.last_error_msg = None
-if "last_error_trace" not in st.session_state:
-    st.session_state.last_error_trace = None
-if "save_path" not in st.session_state:
-    st.session_state.save_path = None
-if "run_folder" not in st.session_state:
-    st.session_state.run_folder = None
-# Phase 2 image state
-if "image_prompts" not in st.session_state:
-    st.session_state.image_prompts = None
-if "image_results" not in st.session_state:
-    st.session_state.image_results = None
-if "img_error_msg" not in st.session_state:
-    st.session_state.img_error_msg = None
-# Phase 3 video state
-if "video_clips" not in st.session_state:
-    st.session_state.video_clips = {}
-if "video_error_msg" not in st.session_state:
-    st.session_state.video_error_msg = None
-if "final_video_path" not in st.session_state:
-    st.session_state.final_video_path = None
-# Phase 4 captions state
-if "captions" not in st.session_state:
-    st.session_state.captions = None
-if "cap_error_msg" not in st.session_state:
-    st.session_state.cap_error_msg = None
-
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -495,7 +566,7 @@ if generate_clicked or full_run_clicked:
                 active_lora = st.session_state.get("lora_url", "").strip()
                 status_placeholder.markdown('<div class="status-box">⏳ Generating Images...</div>', unsafe_allow_html=True)
                 try:
-                    prompts = build_image_prompts(package["shots"], lora_url=active_lora, llm_id=llm_id)
+                    prompts = build_image_prompts(package["shots"], lora_url=active_lora, llm_id=llm_id, style_guide=st.session_state.style_guide or None)
                     st.session_state.image_prompts = prompts
                     st.session_state.image_results = generate_all_images(prompts, folder, active_lora, IMAGE_MODELS[image_model_choice])
                     package.update({"image_prompts": prompts, "image_results": st.session_state.image_results})
@@ -731,7 +802,7 @@ if st.session_state.content_package:
                 '<div class="status-box">🎨 Claude is writing cinematic image prompts...</div>',
                 unsafe_allow_html=True,
             )
-            image_prompts = build_image_prompts(pkg["shots"], lora_url=active_lora, llm_id=llm_id)
+            image_prompts = build_image_prompts(pkg["shots"], lora_url=active_lora, llm_id=llm_id, style_guide=st.session_state.style_guide or None)
             st.session_state.image_prompts = image_prompts
 
             # Step 2 — Replicate generates all images in parallel

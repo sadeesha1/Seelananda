@@ -1,12 +1,21 @@
 """
-image_tools.py — Replicate Flux Dev LoRA image generation for Aksha (Phase 2).
+image_tools.py — Replicate image generation for Aksha (Phase 2).
 
 Tools:
-  build_image_prompts(shots_json, lora_url)  → calls Claude to fill IMAGE_PROMPT_TEMPLATE
-  generate_image(prompt, shot_number, frame_type, run_folder, lora_url) → local Path
-  generate_all_images(image_prompts_json, run_folder, lora_url, progress_cb) → dict
+  build_style_guide(clothing_images, background_images, kitchenware_images, llm_id)
+      → Analyze reference images and return a locked style guide JSON
+
+  build_image_prompts(shots_json, lora_url, llm_id, style_guide)
+      → calls LLM to fill IMAGE_PROMPT_TEMPLATE, enforcing style_guide consistency
+
+  generate_image(prompt, shot_number, frame_type, run_folder, lora_url, image_model_id)
+      → local Path
+
+  generate_all_images(image_prompts_json, run_folder, lora_url, image_model_id, progress_cb)
+      → dict
 """
 
+import base64
 import json
 import os
 import re
@@ -20,6 +29,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import replicate
+import anthropic
 
 # Ensure Replicate API key is set and create client
 replicate_api_key = os.environ.get("REPLICATE_API_KEY")
@@ -50,20 +60,193 @@ MAX_RETRIES = 3
 MAX_WORKERS = 4  # Parallel Replicate calls
 
 
-# ── Tool 4: build_image_prompts ────────────────────────────────────────────────
+# ── Style guide builder (vision) ───────────────────────────────────────────────
 
-def build_image_prompts(shots_json: dict, lora_url: str = "", llm_id: str = None) -> dict:
+def build_style_guide(
+    clothing_images: list,
+    background_images: list,
+    kitchenware_images: list,
+    llm_id: str = None,
+) -> dict:
     """
-    Ask Claude to fill IMAGE_PROMPT_TEMPLATE for each shot (start + end frame).
+    Analyze reference images via LLM vision and return a locked style guide JSON.
+    The style guide is then passed to build_image_prompts to enforce consistency
+    across all generated frames.
 
     Args:
-        shots_json: Output dict from plan_shots(), containing shots list.
-        lora_url:   LoRA weights URL (informational — passed through to output).
-        llm_id:     LLM model ID (e.g., "claude-sonnet-4-6"). Uses CLAUDE_MODEL if None.
+        clothing_images:    List of image bytes (up to 5) for outfit references.
+        background_images:  List of image bytes (up to 5) for kitchen/background refs.
+        kitchenware_images: List of image bytes (up to 5) for tool/kitchenware refs.
+        llm_id:             LLM model ID. Uses CLAUDE_MODEL if None.
+
+    Returns:
+        dict with keys: clothing, background, kitchenware (only sections with images).
+        Example:
+        {
+          "clothing": {
+            "outfit_description": "sage linen apron over cream blouse",
+            "colors": ["sage green", "cream"],
+            "key_details": "apron strings tied at waist, loose relaxed fit"
+          },
+          "background": {
+            "description": "modern kitchen with terracotta floor tiles",
+            "key_elements": ["copper pots hanging", "pink neon strip light"],
+            "lighting": "warm natural window light from left, pink neon accent"
+          },
+          "kitchenware": {
+            "items": ["copper saucepan", "wooden cutting board"],
+            "style": "artisanal handmade aesthetic",
+            "key_details": "copper and wood dominant, aged patina finish"
+          }
+        }
+    """
+    if llm_id is None:
+        llm_id = CLAUDE_MODEL
+
+    def _to_b64(file_bytes: bytes) -> str:
+        return base64.b64encode(file_bytes).decode("utf-8")
+
+    def _img_media_type(file_bytes: bytes) -> str:
+        """Detect image media type from magic bytes (Python 3.13 compatible)."""
+        if file_bytes.startswith(b'\xff\xd8\xff'):
+            return "image/jpeg"
+        elif file_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
+            return "image/png"
+        elif file_bytes.startswith(b'RIFF') and b'WEBP' in file_bytes[:20]:
+            return "image/webp"
+        elif file_bytes.startswith(b'GIF87a') or file_bytes.startswith(b'GIF89a'):
+            return "image/gif"
+        else:
+            return "image/jpeg"  # default fallback
+
+    sections = {}
+    if clothing_images:
+        sections["clothing"] = clothing_images[:5]
+    if background_images:
+        sections["background"] = background_images[:5]
+    if kitchenware_images:
+        sections["kitchenware"] = kitchenware_images[:5]
+
+    if not sections:
+        return {}
+
+    system = (
+        "You are a visual style analyst for Aksha, a Sri Lankan cooking influencer. "
+        "Analyse the provided reference images and extract precise, detailed style "
+        "descriptions that can lock visual consistency across AI-generated images."
+    )
+
+    section_labels = {
+        "clothing": "CLOTHING / OUTFIT REFERENCES",
+        "background": "KITCHEN / BACKGROUND REFERENCES",
+        "kitchenware": "KITCHENWARE / TOOLS REFERENCES",
+    }
+
+    instructions = (
+        "Analyse the reference images provided and return a JSON style guide.\n\n"
+        "For each section, describe the visual elements with enough precision that an "
+        "AI image model can reproduce them identically in every frame.\n\n"
+        "Return ONLY valid JSON (no markdown):\n"
+        "{\n"
+        '  "clothing": {\n'
+        '    "outfit_description": "<exact full outfit description>",\n'
+        '    "colors": ["<color1>", "<color2>"],\n'
+        '    "key_details": "<fabrics, fit, accessories, apron style, etc>"\n'
+        "  },\n"
+        '  "background": {\n'
+        '    "description": "<full kitchen/background scene description>",\n'
+        '    "key_elements": ["<element1>", "<element2>"],\n'
+        '    "lighting": "<exact lighting setup — direction, color temperature, accent lights>"\n'
+        "  },\n"
+        '  "kitchenware": {\n'
+        '    "items": ["<item1>", "<item2>"],\n'
+        '    "style": "<overall aesthetic>",\n'
+        '    "key_details": "<materials, colors, arrangement, patina, brand cues>"\n'
+        "  }\n"
+        "}\n\n"
+        "Only include keys for sections that had reference images."
+    )
+
+    if llm_id.startswith("claude"):
+        client = anthropic.Anthropic()
+        content = [{"type": "text", "text": instructions}]
+        for section_name, images in sections.items():
+            content.append({"type": "text", "text": f"\n\n--- {section_labels[section_name]} ---"})
+            for img_bytes in images:
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": _img_media_type(img_bytes),
+                        "data": _to_b64(img_bytes),
+                    },
+                })
+        response = client.messages.create(
+            model=llm_id,
+            max_tokens=2000,
+            system=system,
+            messages=[{"role": "user", "content": content}],
+        )
+        raw = response.content[0].text.strip()
+    else:
+        # OpenAI-compatible — SambaNova Llama-4 supports vision via data URLs
+        try:
+            from sambanova import SambaNova
+        except ImportError:
+            raise RuntimeError("sambanova package not installed. Run: pip install sambanova")
+        client = SambaNova(api_key=os.environ.get("SAMBANOVA_API_KEY"))
+        content = [{"type": "text", "text": instructions}]
+        for section_name, images in sections.items():
+            content.append({"type": "text", "text": f"\n\n--- {section_labels[section_name]} ---"})
+            for img_bytes in images:
+                media_type = _img_media_type(img_bytes)
+                b64 = _to_b64(img_bytes)
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media_type};base64,{b64}"},
+                })
+        response = client.chat.completions.create(
+            model=llm_id,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": content},
+            ],
+            max_tokens=2000,
+        )
+        raw = response.choices[0].message.content.strip()
+
+    raw = re.sub(r"^```(?:json)?\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+# ── Tool 4: build_image_prompts ────────────────────────────────────────────────
+
+def build_image_prompts(
+    shots_json: dict,
+    lora_url: str = "",
+    llm_id: str = None,
+    style_guide: dict = None,
+) -> dict:
+    """
+    Ask the LLM to fill IMAGE_PROMPT_TEMPLATE for each shot (start + end frame).
+    When style_guide is provided, the LLM is instructed to lock outfit, background,
+    and kitchenware identically across all shots to maintain visual consistency.
+
+    Args:
+        shots_json:   Output dict from plan_shots(), containing shots list.
+        lora_url:     LoRA weights URL (informational — passed through to output).
+        llm_id:       LLM model ID (e.g., "claude-sonnet-4-6"). Uses CLAUDE_MODEL if None.
+        style_guide:  Optional dict from build_style_guide(). When provided, all shots
+                      will use the exact same outfit, background, and kitchenware.
 
     Returns:
         dict with:
           lora_url: str
+          style_guide: dict (echoed back)
           prompts: list of {shot_number, shot_name, start_frame_prompt, end_frame_prompt}
     """
     if llm_id is None:
@@ -79,21 +262,81 @@ def build_image_prompts(shots_json: dict, lora_url: str = "", llm_id: str = None
         for s in shots
     )
 
-    prompt = f"""You are a Flux image prompt engineer for Aksha, a Sri Lankan cooking influencer.
+    # Build style constraint block
+    if style_guide:
+        clothing = style_guide.get("clothing", {})
+        background = style_guide.get("background", {})
+        kitchenware = style_guide.get("kitchenware", {})
 
+        style_block = "\n\nSTYLE GUIDE — LOCKED FOR ALL SHOTS (copy these exactly, do NOT vary between shots):\n"
+        if clothing:
+            style_block += (
+                f"\nOUTFIT (use verbatim in every shot):\n"
+                f"  outfit_description: {clothing.get('outfit_description', '')}\n"
+                f"  colors: {', '.join(clothing.get('colors', []))}\n"
+                f"  key_details: {clothing.get('key_details', '')}\n"
+            )
+        if background:
+            style_block += (
+                f"\nBACKGROUND (use verbatim in every shot):\n"
+                f"  description: {background.get('description', '')}\n"
+                f"  key_elements: {', '.join(background.get('key_elements', []))}\n"
+                f"  lighting: {background.get('lighting', '')}\n"
+            )
+        if kitchenware:
+            style_block += (
+                f"\nKITCHENWARE (reference where visible):\n"
+                f"  items: {', '.join(kitchenware.get('items', []))}\n"
+                f"  style: {kitchenware.get('style', '')}\n"
+                f"  key_details: {kitchenware.get('key_details', '')}\n"
+            )
+
+        outfit_instruction = (
+            "- Fill in outfit: USE EXACTLY the outfit_description from the STYLE GUIDE above — "
+            "identical across every single shot"
+        )
+        lighting_instruction = (
+            "- Fill in lighting: USE EXACTLY the lighting from the STYLE GUIDE above — "
+            "identical across every single shot"
+        )
+        background_instruction = (
+            "- Background: include the background description from the STYLE GUIDE verbatim — "
+            "same kitchen, same elements, same layout in every shot"
+        )
+    else:
+        style_block = ""
+        outfit_instruction = (
+            '- Fill in outfit: choose ONE casual-chic cooking outfit and use it for ALL shots '
+            '(e.g. "sage linen apron over cream blouse") — must be identical in every prompt'
+        )
+        lighting_instruction = (
+            '- Fill in lighting: use "warm pink neon accent lighting with natural window light" '
+            "for every shot — identical in all prompts"
+        )
+        background_instruction = (
+            "- Background: always the same modern kitchen with terracotta tiles, copper pots, "
+            "and pink neon accent lighting — consistent in every shot"
+        )
+
+    prompt = f"""You are a Flux image prompt engineer for Aksha, a Sri Lankan cooking influencer.
+{style_block}
 IMAGE PROMPT TEMPLATE (fill in the placeholders):
 {IMAGE_PROMPT_TEMPLATE.replace("{shot_action}", "{{shot_action}}").replace("{camera_angle}", "{{camera_angle}}").replace("{lighting}", "{{lighting}}").replace("{outfit}", "{{outfit}}")}
 
 For each shot below, generate TWO prompts:
 1. start_frame_prompt — the beginning moment of the shot
-2. end_frame_prompt — the ending moment of the shot (slightly different action/pose)
+2. end_frame_prompt — the ending moment of the shot (slightly different action/pose only)
+
+CONSISTENCY RULES — every prompt in this batch must be identical for these elements:
+{outfit_instruction}
+{lighting_instruction}
+{background_instruction}
+- Only shot_action should vary between start and end frames — never outfit, background, or lighting
 
 Both prompts must:
 - Always start with "Aksha," (trigger word)
 - Fill in shot_action: describe exactly what Aksha or the food looks like in that frame
 - Fill in camera_angle: use the shot's angle verbatim
-- Fill in lighting: always "warm pink neon accent lighting with natural window light"
-- Fill in outfit: choose a fitting casual-chic cooking outfit (e.g. "sage linen apron over cream blouse", "dusty rose oversized shirt")
 - Be vivid, specific, cinematic — describe textures, steam, drips, hands, expressions
 
 SHOTS:
@@ -117,6 +360,7 @@ Return ONLY a valid JSON object (no markdown):
     raw = re.sub(r"\n?```$", "", raw)
     result = json.loads(raw)
     result["lora_url"] = lora_url
+    result["style_guide"] = style_guide or {}
     return result
 
 
@@ -131,14 +375,15 @@ def generate_image(
     image_model_id: str,
 ) -> Path:
     """
-    Generate a single image via Replicate Flux Dev LoRA, save locally.
+    Generate a single image via Replicate, save locally.
 
     Args:
-        prompt:      Full Flux image prompt string.
-        shot_number: Shot number (for file naming).
-        frame_type:  "start" or "end".
-        run_folder:  Root output folder for this run (images/ subfolder created inside).
-        lora_url:    Replicate LoRA weights URL.
+        prompt:         Full image prompt string.
+        shot_number:    Shot number (for file naming).
+        frame_type:     "start" or "end".
+        run_folder:     Root output folder for this run (images/ subfolder created inside).
+        lora_url:       Optional Replicate LoRA weights URL (empty string to skip).
+        image_model_id: Replicate model ID.
 
     Returns:
         Path to saved local PNG file.
@@ -166,34 +411,30 @@ def generate_image(
                 if lora_url and lora_url.strip():
                     payload["hf_lora"] = lora_url
                     payload["lora_scale"] = LORA_SCALE
-            
+
             output = replicate_client.run(
                 image_model_id,
                 input=payload,
             )
 
-            # output is a list of FileOutput objects (or URLs)
             image_obj = output[0] if isinstance(output, list) else output
 
-            # Handle both URL strings and FileOutput objects
             if hasattr(image_obj, "url"):
                 image_url = image_obj.url
             elif hasattr(image_obj, "read"):
-                # FileOutput — read bytes directly
                 with open(out_path, "wb") as f:
                     f.write(image_obj.read())
                 return out_path
             else:
                 image_url = str(image_obj)
 
-            # Download from URL
             urllib.request.urlretrieve(image_url, out_path)
             return out_path
 
         except Exception as exc:
             last_exc = exc
             if attempt < MAX_RETRIES:
-                time.sleep(2 ** attempt)  # exponential back-off: 2s, 4s
+                time.sleep(2 ** attempt)
             continue
 
     raise RuntimeError(
@@ -213,34 +454,9 @@ def generate_all_images(
 ) -> dict:
     """
     Generate all start + end frames for all shots in parallel.
-
-    Args:
-        image_prompts_json: Output of build_image_prompts().
-        run_folder:         Root output folder (images/ created inside).
-        lora_url:           Replicate LoRA weights URL.
-        progress_cb:        Optional callable(completed: int, total: int, label: str)
-                            called after each image finishes.
-
-    Returns:
-        dict: {
-          "shots": [
-            {
-              "shot_number": int,
-              "shot_name": str,
-              "start_frame_prompt": str,
-              "end_frame_prompt": str,
-              "start_frame_path": str,   # local path or None on failure
-              "end_frame_path": str,
-              "start_frame_error": str,  # error message or None
-              "end_frame_error": str,
-            },
-            ...
-          ]
-        }
     """
     prompts = image_prompts_json.get("prompts", [])
 
-    # Build flat task list: (shot_num, shot_name, frame_type, prompt)
     tasks = []
     for p in prompts:
         tasks.append((p["shot_number"], p["shot_name"], "start", p["start_frame_prompt"]))
@@ -248,8 +464,6 @@ def generate_all_images(
 
     total = len(tasks)
     completed_count = 0
-
-    # results keyed by (shot_number, frame_type)
     results: dict[tuple, dict] = {}
 
     def _run_one(task):
@@ -281,7 +495,6 @@ def generate_all_images(
                 label = f"Shot {shot_num} ({frame_type} frame)"
                 progress_cb(completed_count, total, label)
 
-    # Assemble ordered output
     shot_outputs = []
     for p in prompts:
         sn = p["shot_number"]

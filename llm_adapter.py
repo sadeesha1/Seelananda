@@ -26,7 +26,13 @@ def get_llm_response(prompt: str, system_prompt: str, max_tokens: int, llm_id: s
             model=llm_id,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
-            system=system_prompt
+            system=[
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]
         )
         return resp.content[0].text
     else:

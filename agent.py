@@ -267,7 +267,13 @@ def run_agent(user_prompt: str, status_callback=None, llm_id: str = None) -> dic
         response = client.messages.create(
             model=llm_id,
             max_tokens=MAX_TOKENS,
-            system=AKSHA_SYSTEM_PROMPT,
+            system=[
+                {
+                    "type": "text",
+                    "text": AKSHA_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
             tools=TOOL_DEFINITIONS,
             messages=messages,
         )
